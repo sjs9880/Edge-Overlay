@@ -8,6 +8,7 @@ import win32con
 import win32api
 import ctypes
 import keyboard
+import time
 
 # High DPI 인식 설정 (High DPI Awareness)
 try:
@@ -33,7 +34,7 @@ class SettingsWidget(QtWidgets.QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Edge Overlay v1.3")
+        self.setWindowTitle("Edge Overlay v1.4")
         self.setWindowFlags(QtCore.Qt.WindowStaysOnTopHint)
         self.resize(300, 400)
         
@@ -187,6 +188,10 @@ class CaptureWorker(QtCore.QThread):
         self.region = None # (lx, ly, w, h)
         self.request_one_shot_auto = False # 1회성 자동 조절 요청 플래그
         
+        # 최적화 변수
+        self.rgba_buffer = None
+        self.last_buffer_shape = None
+        
         # DXCam 초기화
         self._init_camera(0)
 
@@ -197,7 +202,9 @@ class CaptureWorker(QtCore.QThread):
                 old_cam = self.cam
                 self.cam = None # 속성은 유지하되 값만 None으로 변경 (run 루프 안전)
                 del old_cam
-                
+            
+            # output_color="BGR" 대신 "GRAY"를 고려할 수 있으나, DXCam은 기본적으로 RGB/BGR 지원이 강력함.
+            # 그대로 BGR 사용 (OpenCV 변환이 빠름)
             self.cam = dxcam.create(output_idx=monitor_idx, output_color="BGR")
             self.current_monitor_idx = monitor_idx
         except Exception as e:
@@ -210,11 +217,15 @@ class CaptureWorker(QtCore.QThread):
             # 모니터 변경 시 카메라 재초기화
             self._init_camera(monitor_idx)
             
+        # 영역 크기가 변경되면 버퍼 초기화 필요 (run 루프에서 처리하도록 함)
+
     def trigger_auto_adjust(self):
         self.request_one_shot_auto = True
 
     def run(self):
         while self.running:
+            loop_start = time.time()
+            
             if self.paused or self.cam is None or self.region is None:
                 self.msleep(100)
                 continue
@@ -243,45 +254,72 @@ class CaptureWorker(QtCore.QThread):
                 
             # 이미지 처리 (Process Image)
             try:
+                # 그레이스케일 변환
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 
-                # 자동 조절 로직 (실시간 또는 1회성 요청)
+                # 자동 조절 로직
                 if Config.REALTIME_AUTO or self.request_one_shot_auto:
                     self._calculate_auto_threshold(gray)
-                    self.request_one_shot_auto = False # 요청 처리 완료
+                    self.request_one_shot_auto = False
                 
+                # 가우시안 블러 -> Canny
                 blurred = cv2.GaussianBlur(gray, (5, 5), 0)
                 edges = cv2.Canny(blurred, Config.CANNY_MIN, Config.CANNY_MAX)
                 
+                # 팽창 (Thickness)
                 if Config.EDGE_THICKNESS > 1:
                     kernel = np.ones((Config.EDGE_THICKNESS, Config.EDGE_THICKNESS), np.uint8)
                     edges = cv2.dilate(edges, kernel, iterations=1)
                     
-                # RGBA 변환
+                # RGBA 변환 최적화 (버퍼 재사용)
                 h_img, w_img = edges.shape
-                rgba_image = np.zeros((h_img, w_img, 4), dtype=np.uint8)
                 
+                # 버퍼 크기 확인 및 재할당
+                if self.rgba_buffer is None or self.last_buffer_shape != (h_img, w_img):
+                    self.rgba_buffer = np.zeros((h_img, w_img, 4), dtype=np.uint8)
+                    self.last_buffer_shape = (h_img, w_img)
+                else:
+                    # 버퍼 초기화 (전체 0으로)
+                    # self.rgba_buffer.fill(0) # 혹은 아래에서 마스킹으로 처리
+                    # 마스크 기반 할당이므로 투명 영역은 0이어야 함. 
+                    # 이전 프레임의 잔상을 지우기 위해 fill(0)은 필수적이나 느릴 수 있음.
+                    # 하지만 Canny edge는 희소하므로 마스크 영역만 갱신하면 잔상이 남음.
+                    # -> fill(0)을 해야 함.
+                     self.rgba_buffer.fill(0)
+                
+                # 색상 적용
                 r, g, b = Config.EDGE_COLOR
                 mask = edges > 0
-                rgba_image[mask, 0] = r
-                rgba_image[mask, 1] = g
-                rgba_image[mask, 2] = b
-                rgba_image[mask, 3] = Config.EDGE_OPACITY
                 
-                qt_image = QtGui.QImage(rgba_image.data, w_img, h_img, w_img * 4, QtGui.QImage.Format_RGBA8888).copy()
+                # numpy bad mask error 방지를 위해 안전장치? (shape 일치하므로 불필요)
+                # 고급 인덱싱 사용 - 색상은 고정이므로 미리 튜플이 아닌 배열로 준비하면 더 빠를 수 있음.
+                self.rgba_buffer[mask, 0] = r
+                self.rgba_buffer[mask, 1] = g
+                self.rgba_buffer[mask, 2] = b
+                self.rgba_buffer[mask, 3] = Config.EDGE_OPACITY
+                
+                # QImage 생성 (버퍼 공유)
+                # copy()를 하지 않으면 스레드 경합 문제 발생 가능성 있음?
+                # QImage가 데이터를 참조하므로, 다음 프레임에서 rgba_buffer를 수정하면 UI 표시 중인 이미지가 깨질 수 있음.
+                # 따라서 .copy()는 안전을 위해 유지하는 것이 좋음.
+                qt_image = QtGui.QImage(self.rgba_buffer.data, w_img, h_img, w_img * 4, QtGui.QImage.Format_RGBA8888).copy()
                 self.sig_frame_ready.emit(qt_image)
                 
             except Exception as e:
                 print(f"이미지 처리 오류: {e}")
 
-            # 주사율 제어 (Control refresh rate)
+            # 주사율 제어 (정밀 타이밍)
             if Config.REFRESH_RATE > 0:
-                self.msleep(int(1000 / Config.REFRESH_RATE))
+                elapsed = time.time() - loop_start
+                target_interval = 1.0 / Config.REFRESH_RATE
+                sleep_time = target_interval - elapsed
+                
+                if sleep_time > 0:
+                    self.msleep(int(sleep_time * 1000))
             else:
-                self.msleep(16)
+                self.msleep(1) # 최대 속도 제한 해제 시에도 최소한의 sleep 권장
 
     def _calculate_auto_threshold(self, gray_image):
-        # 메인 스레드 로직과 동일한 자동 조절 로직
         h, w = gray_image.shape
         if w > 320:
             small_gray = cv2.resize(gray_image, (0, 0), fx=0.2, fy=0.2, interpolation=cv2.INTER_NEAREST)
@@ -293,7 +331,6 @@ class CaptureWorker(QtCore.QThread):
         lower = int(max(0, (1.0 - sigma) * v))
         upper = int(min(255, (1.0 + sigma) * v))
         
-        # 공유 설정 업데이트
         Config.CANNY_MIN = lower
         Config.CANNY_MAX = upper
 
